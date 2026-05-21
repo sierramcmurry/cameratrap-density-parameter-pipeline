@@ -43,18 +43,14 @@ AI coordinate outputs + WI metadata
 ```
 ├── README.md
 ├── LICENSE
-├── R/
-│   ├── 00_config.R                     # Configuration and file paths
-│   ├── 01_data_preparation.R           # Data loading, joining, quality filtering
-│   ├── 02_sbd_speed.R                  # SBD speed estimation with coordinate anchoring
-│   ├── 03_activity.R                   # Activity level via circular kernel density
-│   ├── 04_staying_time.R               # Staying time via bounding box interpolation
-│   └── 05b_edd_joint_estimation.R      # Joint multi-species hierarchical EDD model (NIMBLE)
-├── vignette/
-│   ├── vignette_parameter_estimation.Rmd   # Worked example (start here)
-│   └── example_vignette_data.csv           # Example dataset (28 deployments, 9 species)
-└── data/
-    └── README_data.md                  # Description of input data format
+├── 00_config.R                         # Configuration and file paths
+├── 01_data_preparation.R               # Data loading, joining, quality filtering
+├── 02_sbd_speed.R                      # SBD speed estimation with coordinate anchoring
+├── 03_activity.R                       # Activity level via circular kernel density
+├── 04_staying_time.R                   # Staying time via bounding box interpolation
+├── 05b_edd_joint_estimation.R          # Joint multi-species hierarchical EDD model (NIMBLE)
+├── vignette_parameter_estimation.Rmd   # Worked example (start here)
+└── example_vignette_data.csv           # Example dataset (28 deployments, 9 species)
 ```
 
 ## Quick Start
