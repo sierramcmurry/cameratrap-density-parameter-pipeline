@@ -151,6 +151,6 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 
 ## Contact
 
-Sierra McMurry — Department of Forestry and Environmental Resources, North Carolina State University
+Sierra McMurry — Department of Forestry and Environmental Resources, North Carolina State University (stmcmurr@ncsu.edu).
 
 For questions about the AI depth estimation pipeline, contact Mohammed Alyetam ([GitHub](https://github.com/Alyetama)).
