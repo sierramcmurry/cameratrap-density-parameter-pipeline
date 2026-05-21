@@ -1,0 +1,824 @@
+---
+title: "Automated Parameter Estimation for Camera Trap Density Models"
+subtitle: "A worked example using the CV-enhanced distance sampling pipeline"
+author: "Sierra McMurry, Ben Goldstein, Mohammed Alyetam, Roland Kays"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    highlight: tango
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+# Introduction
+
+This vignette demonstrates the complete parameter estimation pipeline described in McMurry et al. (in review). Starting from AI-derived animal coordinates and Wildlife Insights metadata, we estimate all four parameters required for camera trap density models:
+
+1. **Movement speed** — via Size-Biased Distribution (SBD) correction
+2. **Activity level** — via circular kernel density estimation
+3. **Staying time** — via bounding box interpolation
+4. **Effective detection distance (EDD)** — via a joint multi-species hierarchical model
+
+These parameters are direct inputs for the Random Encounter Model (REM; Rowcliffe et al. 2008), Camera Trap Distance Sampling (CTDS; Howe et al. 2017), and the Random Encounter and Staying Time model (REST; Nakashima et al. 2018).
+
+## Example dataset
+
+We use 28 camera deployments from a montane forest array in Montana, USA, containing approximately 20,000 AI-processed frames across 9 mammal species.
+
+## Prerequisites
+
+```{r packages}
+library(tidyverse)
+library(activity)    # Activity level estimation
+library(nimble)      # Joint EDD model
+library(MCMCvis)     # MCMC diagnostics
+library(coda)        # MCMC convergence
+```
+
+# 1. Load and inspect data
+
+## 1.1 Input files
+
+The pipeline requires two inputs:
+
+1. **AI coordinate output** — a CSV with one row per detected animal per frame, containing world coordinates (world_x, world_z) estimated by the depth pipeline, bounding box coordinates, timestamps, and species identifications.
+2. **Deployment metadata** — start/end dates, camera model, and location for each deployment.
+
+```{r load-data}
+# Load the example dataset
+data <- read.csv("example_vignette_data.csv", stringsAsFactors = FALSE)
+data$timestamp_clean <- as.POSIXct(data$timestamp_clean, tz = "UTC")
+
+cat("Frames:", nrow(data), "\n")
+cat("Species:", n_distinct(data$common_name_clean), "\n")
+cat("Deployments:", n_distinct(data$deployment_id_clean), "\n")
+```
+
+## 1.2 Inspect the data structure
+
+Key columns from the AI pipeline:
+
+```{r inspect}
+data %>%
+  select(deployment_id_clean, sequence_id_use, common_name_clean,
+         timestamp_clean, world_x, world_z, x1, y1, x2, y2,
+         detection_confidence) %>%
+  head(10)
+```
+
+- `world_x`: lateral position (meters) relative to camera
+- `world_z`: forward distance (meters) from camera (used as detection distance)
+- `x1, y1, x2, y2`: bounding box pixel coordinates
+- `sequence_id_use`: groups frames from the same detection event
+
+## 1.3 Species summary
+
+```{r species-summary}
+data %>%
+  group_by(common_name_clean) %>%
+  summarise(
+    n_frames = n(),
+    n_sequences = n_distinct(sequence_id_use),
+    n_deployments = n_distinct(deployment_id_clean),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_frames)) %>%
+  knitr::kable(col.names = c("Species", "Frames", "Sequences", "Deployments"))
+```
+
+# 2. Quality filtering
+
+Before estimating parameters, we apply quality filters to remove unreliable AI coordinate estimates. Filters are applied at two levels: frame-level (for distance estimation) and sequence-level (for speed estimation).
+
+## 2.1 Frame-level filters
+
+```{r frame-filters}
+# Get image dimensions for bounding box area calculation
+# Assuming standard camera trap resolution; adjust for your cameras
+IMG_WIDTH <- 2048
+IMG_HEIGHT <- 1536
+
+data <- data %>%
+  mutate(
+    # Bounding box area as proportion of frame
+    bbox_width = x2 - x1,
+    bbox_height = y2 - y1,
+    bbox_area_pct = (bbox_width * bbox_height) / (IMG_WIDTH * IMG_HEIGHT) * 100,
+    
+    # Frame-level flags
+    flag_bbox_too_large = bbox_area_pct > 80,
+    flag_too_close = world_z < 1,
+    flag_too_far = world_z > 26,
+    flag_any_frame = flag_bbox_too_large | flag_too_close | flag_too_far
+  )
+
+# Summary of frame-level filtering
+cat("Frame-level filter summary:\n")
+cat("  Bbox >80% of frame:", sum(data$flag_bbox_too_large, na.rm = TRUE), "\n")
+cat("  Too close (<1m):", sum(data$flag_too_close, na.rm = TRUE), "\n")
+cat("  Too far (>26m):", sum(data$flag_too_far, na.rm = TRUE), "\n")
+cat("  Total flagged:", sum(data$flag_any_frame, na.rm = TRUE),
+    "(", round(mean(data$flag_any_frame, na.rm = TRUE) * 100, 1), "%)\n")
+
+# Remove flagged frames for distance estimation
+data_clean <- data %>% filter(!flag_any_frame)
+cat("  Retained:", nrow(data_clean), "frames\n")
+```
+
+## 2.2 Add time variables
+
+```{r time-vars}
+data_clean <- data_clean %>%
+  mutate(
+    hour = as.numeric(format(timestamp_clean, "%H")) +
+           as.numeric(format(timestamp_clean, "%M")) / 60 +
+           as.numeric(format(timestamp_clean, "%S")) / 3600
+  )
+```
+
+# 3. Movement speed estimation
+
+Movement speed is estimated using the Size-Biased Distribution (SBD) framework (Rowcliffe et al. 2016). Camera traps over-sample faster-moving animals because they cross the detection zone more frequently. The SBD correction uses the harmonic mean to recover the true population mean speed.
+
+## 3.1 Timestamp collapse
+
+Camera traps operating in burst mode capture multiple frames within the same second. Small AI coordinate shifts between burst images accumulate as artificial movement. We collapse each sequence to one coordinate per unique timestamp.
+
+```{r timestamp-collapse}
+collapsed <- data_clean %>%
+  group_by(sequence_id_use, deployment_id_clean, common_name_clean) %>%
+  arrange(timestamp_clean) %>%
+  mutate(
+    # Unique second within sequence
+    time_sec = as.numeric(difftime(timestamp_clean, min(timestamp_clean), units = "secs")),
+    unique_sec = floor(time_sec)
+  ) %>%
+  # Keep first frame per unique second
+  group_by(sequence_id_use, deployment_id_clean, common_name_clean, unique_sec) %>%
+  slice(1) %>%
+  ungroup()
+
+cat("Before collapse:", nrow(data_clean), "frames\n")
+cat("After collapse:", nrow(collapsed), "frames\n")
+```
+
+## 3.2 Compute frame-to-frame step distances
+
+```{r step-distances}
+collapsed <- collapsed %>%
+  group_by(sequence_id_use) %>%
+  arrange(timestamp_clean) %>%
+  mutate(
+    dx = world_x - lag(world_x),
+    dz = world_z - lag(world_z),
+    dt = as.numeric(difftime(timestamp_clean, lag(timestamp_clean), units = "secs")),
+    step_distance = sqrt(dx^2 + dz^2),
+    frame_speed = ifelse(dt > 0, step_distance / dt, NA_real_)
+  ) %>%
+  ungroup()
+```
+
+## 3.3 Coordinate anchoring
+
+The AI-estimated position of a stationary animal can shift slightly due to posture changes (coordinate jitter). We use species-specific anchoring thresholds to zero out sub-threshold movements.
+
+```{r anchoring}
+# Species-specific anchoring thresholds (from Kneedle algorithm + manual overrides)
+anchoring_thresholds <- tibble(
+  common_name_clean = c("White-tailed Deer", "American Black Bear", "Mule Deer",
+                         "Elk", "Snowshoe Hare", "Red Squirrel", "Bobcat",
+                         "Coyote", "Moose", "Puma", "Wild Turkey", "Red Fox"),
+  threshold = c(0.75, 0.75, 0.50, 1.00, 0.10, 0.10, 1.00,
+                0.30, 0.50, 0.30, 0.50, 0.20)
+)
+
+collapsed <- collapsed %>%
+  left_join(anchoring_thresholds, by = "common_name_clean") %>%
+  mutate(
+    # Zero out steps below species-specific threshold
+    step_anchored = ifelse(!is.na(step_distance) & step_distance < threshold,
+                           0, step_distance)
+  )
+
+cat("Example anchoring thresholds:\n")
+print(anchoring_thresholds)
+```
+
+## 3.4 Sequence-level filters and speed calculation
+
+```{r sequence-speed}
+# Compute sequence-level speeds
+sequence_speeds <- collapsed %>%
+  group_by(sequence_id_use, deployment_id_clean, common_name_clean) %>%
+  summarise(
+    n_frames = n(),
+    n_unique_times = n_distinct(unique_sec),
+    duration_secs = max(time_sec) - min(time_sec),
+    path_distance = sum(step_anchored, na.rm = TRUE),
+    group_size = max(1, n_distinct(detection_idx), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(speed = ifelse(duration_secs > 0, path_distance / duration_secs, NA_real_))
+
+# Apply sequence-level filters
+sequence_filtered <- sequence_speeds %>%
+  filter(
+    n_unique_times >= 2,          # Multi-frame requirement
+    duration_secs > 0,            # Non-zero duration
+    !is.na(speed),                # Valid speed
+    speed > 0,                    # Non-zero speed
+    speed < 20,                   # Biological plausibility (<20 m/s)
+    group_size == 1               # Single-animal sequences only
+  )
+
+cat("Sequences before filtering:", nrow(sequence_speeds), "\n")
+cat("Sequences after filtering:", nrow(sequence_filtered), "\n")
+```
+
+## 3.5 Tortuosity filter
+
+Sequences where accumulated coordinate noise produces biologically implausible zigzag paths are removed.
+
+```{r tortuosity}
+# Compute tortuosity (path distance / straight-line distance)
+tortuosity <- collapsed %>%
+  group_by(sequence_id_use) %>%
+  summarise(
+    start_x = first(world_x), start_z = first(world_z),
+    end_x = last(world_x), end_z = last(world_z),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    straight_line = sqrt((end_x - start_x)^2 + (end_z - start_z)^2),
+    straight_line = ifelse(straight_line == 0, NA_real_, straight_line)
+  )
+
+sequence_filtered <- sequence_filtered %>%
+  left_join(tortuosity %>% select(sequence_id_use, straight_line),
+            by = "sequence_id_use") %>%
+  mutate(
+    tortuosity = ifelse(!is.na(straight_line) & straight_line > 0,
+                        path_distance / straight_line, NA_real_)
+  ) %>%
+  left_join(anchoring_thresholds, by = "common_name_clean") %>%
+  mutate(
+    tort_threshold = case_when(
+      common_name_clean %in% c("Red Squirrel", "Snowshoe Hare") ~ 5,
+      common_name_clean == "Elk" ~ 4,
+      TRUE ~ 3
+    )
+  ) %>%
+  filter(is.na(tortuosity) | tortuosity <= tort_threshold)
+
+cat("Sequences after tortuosity filter:", nrow(sequence_filtered), "\n")
+```
+
+## 3.6 SBD speed estimation
+
+The harmonic mean corrects for size-biased sampling, where faster animals are over-represented in the sample.
+
+```{r sbd-speed}
+# SBD speed = harmonic mean
+sbd_by_species <- sequence_filtered %>%
+  group_by(common_name_clean) %>%
+  filter(n() >= 10) %>%  # Minimum 10 sequences
+  summarise(
+    n = n(),
+    sbd_speed = n / sum(1 / speed),    # Harmonic mean
+    arithmetic_mean = mean(speed),
+    .groups = "drop"
+  )
+
+# Bootstrap 95% CIs
+set.seed(42)
+boot_sbd <- function(speeds, n_boot = 1000) {
+  boots <- replicate(n_boot, {
+    s <- sample(speeds, length(speeds), replace = TRUE)
+    length(s) / sum(1 / s)
+  })
+  c(lcl = quantile(boots, 0.025), ucl = quantile(boots, 0.975),
+    se = sd(boots))
+}
+
+sbd_results <- sequence_filtered %>%
+  group_by(common_name_clean) %>%
+  filter(n() >= 10) %>%
+  group_modify(~ {
+    ci <- boot_sbd(.x$speed)
+    tibble(
+      n = nrow(.x),
+      sbd_speed = nrow(.x) / sum(1 / .x$speed),
+      se = ci["se"],
+      lcl = ci["lcl.2.5%"],
+      ucl = ci["ucl.97.5%"]
+    )
+  }) %>%
+  ungroup()
+
+cat("SBD speed estimates:\n")
+sbd_results %>%
+  mutate(across(where(is.numeric) & !matches("^n$"), ~round(., 3))) %>%
+  knitr::kable(col.names = c("Species", "n", "SBD Speed (m/s)", "SE", "LCL", "UCL"))
+```
+
+> **Note:** Only species with ≥10 movement sequences receive speed estimates. Species with fewer sequences (e.g., rare or low-detection species) will show as NA in the final summary. With data from additional arrays or longer deployment periods, more species would meet this threshold. For applied density estimation, we recommend ≥30 sequences per species.
+```
+
+# 4. Activity level estimation
+
+Activity level represents the proportion of the 24-hour cycle during which animals are active (Rowcliffe et al. 2014). We use the `activity` package to fit a circular kernel density to detection timestamps.
+
+```{r activity}
+# Convert detection times to radians (one per sequence, not per frame)
+activity_data <- data_clean %>%
+  group_by(sequence_id_use, common_name_clean) %>%
+  slice_min(timestamp_clean, n = 1) %>%
+  ungroup() %>%
+  mutate(time_rad = (hour / 24) * 2 * pi)
+
+# Estimate activity for species with sufficient detections
+activity_results <- activity_data %>%
+  group_by(common_name_clean) %>%
+  filter(n() >= 40) %>%
+  group_modify(~ {
+    fit <- fitact(.x$time_rad, reps = 100, sample = "data")
+    tibble(
+      n = nrow(.x),
+      activity = fit@act[1],
+      se = fit@act[2],
+      lcl = fit@act[3],
+      ucl = fit@act[4]
+    )
+  }) %>%
+  ungroup()
+
+cat("Activity level estimates:\n")
+activity_results %>%
+  mutate(across(where(is.numeric) & !matches("^n$"), ~round(., 3))) %>%
+  knitr::kable(col.names = c("Species", "n", "Activity", "SE", "LCL", "UCL"))
+```
+
+> **Note:** Activity estimation requires ≥40 independent detections for stable kernel density fitting. Species below this threshold will appear as NA in the final summary. Activity estimates can also vary across arrays and seasons, so site-specific estimates are preferable when sample sizes allow.
+```
+
+## Activity plots
+
+```{r activity-plots, fig.width=10, fig.height=8}
+plot_species <- activity_results$common_name_clean
+
+if (length(plot_species) > 0) {
+  par(mfrow = c(ceiling(length(plot_species) / 2), 2), mar = c(4, 4, 3, 1))
+  
+  for (sp in plot_species) {
+    sp_times <- activity_data %>%
+      filter(common_name_clean == sp) %>%
+      pull(time_rad)
+    
+    fit <- fitact(sp_times, reps = 100, sample = "data")
+    plot(fit, main = sp, ylab = "Detection frequency", xlab = "Time of day",
+         tline = list(col = "darkgreen", lwd = 2))
+  }
+}
+```
+
+# 5. Staying time estimation
+
+Staying time is the total duration an animal is present within the camera's detection zone. We construct a 1-second timeline for each sequence and interpolate gaps using edge detection logic.
+
+## 5.1 Build per-sequence timelines
+
+```{r staying-time}
+# Get bounding box edge information
+# Edge = bbox within outer 1/6 of frame width
+EDGE_FRAC <- 1/6
+
+staying_data <- data_clean %>%
+  mutate(
+    at_left_edge = x1 < (IMG_WIDTH * EDGE_FRAC),
+    at_right_edge = x2 > (IMG_WIDTH * (1 - EDGE_FRAC)),
+    at_edge = at_left_edge | at_right_edge,
+    edge_side = case_when(
+      at_left_edge ~ "left",
+      at_right_edge ~ "right",
+      TRUE ~ "none"
+    )
+  )
+
+# Compute staying time per sequence
+compute_staying_time <- function(seq_data) {
+  
+  times <- sort(unique(floor(as.numeric(
+    difftime(seq_data$timestamp_clean, min(seq_data$timestamp_clean), units = "secs")
+  ))))
+  
+  if (length(times) <= 1) return(tibble(st_g = 1, st_i = 1))
+  
+  # Build 1-second timeline
+  full_timeline <- 0:max(times)
+  n_detected <- rep(0, length(full_timeline))
+  
+  # Fill in observed seconds
+  for (t in times) {
+    idx <- which(full_timeline == t)
+    n_at_t <- seq_data %>%
+      filter(floor(as.numeric(difftime(timestamp_clean, min(seq_data$timestamp_clean),
+                                        units = "secs"))) == t) %>%
+      nrow()
+    n_detected[idx] <- max(1, n_at_t)
+  }
+  
+  # Simple gap interpolation: fill short gaps (<=10 sec) between detections
+  for (i in seq_along(full_timeline)) {
+    if (n_detected[i] == 0) {
+      # Find nearest detection before and after
+      before <- max(which(n_detected[1:i] > 0), na.rm = TRUE)
+      after_idx <- which(n_detected[i:length(n_detected)] > 0)
+      after <- ifelse(length(after_idx) > 0, i + min(after_idx) - 1, NA)
+      
+      if (!is.na(before) && !is.na(after)) {
+        gap_length <- after - before - 1
+        if (gap_length <= 10) {
+          # Check edge conditions
+          before_edge <- seq_data %>%
+            filter(floor(as.numeric(difftime(timestamp_clean,
+                                             min(seq_data$timestamp_clean),
+                                             units = "secs"))) == full_timeline[before]) %>%
+            pull(edge_side) %>% first()
+          after_edge <- seq_data %>%
+            filter(floor(as.numeric(difftime(timestamp_clean,
+                                             min(seq_data$timestamp_clean),
+                                             units = "secs"))) == full_timeline[after]) %>%
+            pull(edge_side) %>% first()
+          
+          # Same edge = animal left and returned, set to absent
+          if (!is.na(before_edge) && !is.na(after_edge) &&
+              before_edge == after_edge && before_edge != "none") {
+            n_detected[i] <- 0
+          } else {
+            # Otherwise interpolate as present
+            n_detected[i] <- round(mean(c(n_detected[before], n_detected[after])))
+            n_detected[i] <- max(1, n_detected[i])
+          }
+        }
+      }
+    }
+  }
+  
+  st_g <- sum(n_detected > 0)  # Group staying time (presence-seconds)
+  st_i <- sum(n_detected)       # Individual staying time (animal-seconds)
+  
+  tibble(st_g = st_g, st_i = st_i)
+}
+
+# Apply to all sequences
+staying_results <- staying_data %>%
+  group_by(sequence_id_use, deployment_id_clean, common_name_clean) %>%
+  group_modify(~ compute_staying_time(.x)) %>%
+  ungroup()
+
+# Summarise by species
+staying_by_species <- staying_results %>%
+  group_by(common_name_clean) %>%
+  summarise(
+    n = n(),
+    mean_st_g = mean(st_g),
+    median_st_g = median(st_g),
+    mean_st_i = mean(st_i),
+    .groups = "drop"
+  )
+
+cat("Staying time estimates:\n")
+staying_by_species %>%
+  mutate(across(where(is.numeric) & !matches("^n$"), ~round(., 1))) %>%
+  knitr::kable(col.names = c("Species", "n", "Mean ST_g (s)", "Median ST_g (s)", "Mean ST_i (s)"))
+```
+
+# 6. Effective detection distance
+
+We estimate deployment-specific effective detection distances using a joint multi-species hierarchical model. The detection function scale parameter is decomposed into a shared deployment-level effect and species-specific offsets.
+
+## 6.1 Prepare detection histograms
+
+We use only the trigger picture (first frame of each sequence) as the detection distance, ensuring independence among observations.
+
+```{r edd-prep}
+# One distance per sequence (trigger picture)
+trigger_dists <- data_clean %>%
+  group_by(sequence_id_use, deployment_id_clean, common_name_clean) %>%
+  slice_min(timestamp_clean, n = 1) %>%
+  ungroup() %>%
+  filter(world_z > 0, world_z <= 26)
+
+cat("Trigger pictures:", nrow(trigger_dists), "\n")
+
+# Build detection histograms
+BIN_WIDTH <- 3
+MAX_DIST <- 27
+breaks <- seq(0, MAX_DIST, by = BIN_WIDTH)
+n_bins <- length(breaks) - 1
+
+# Create species-deployment combinations
+sp_dep <- trigger_dists %>%
+  group_by(common_name_clean, deployment_id_clean) %>%
+  summarise(n_det = n(), .groups = "drop")
+
+cat("Species-deployment combinations:", nrow(sp_dep), "\n")
+cat("Species represented:", n_distinct(sp_dep$common_name_clean), "\n")
+```
+
+## 6.2 Build data for NIMBLE
+
+```{r edd-nimble-data}
+# Species and deployment indices
+species_list <- sort(unique(trigger_dists$common_name_clean))
+deploy_list <- sort(unique(trigger_dists$deployment_id_clean))
+K <- length(species_list)
+I <- length(deploy_list)
+
+# Build observation-level data
+obs_list <- list()
+obs_idx <- 0
+
+for (s in seq_along(species_list)) {
+  for (d in seq_along(deploy_list)) {
+    dets <- trigger_dists %>%
+      filter(common_name_clean == species_list[s],
+             deployment_id_clean == deploy_list[d])
+    
+    if (nrow(dets) == 0) next
+    
+    obs_idx <- obs_idx + 1
+    
+    # Bin the detections
+    hist_counts <- hist(dets$world_z, breaks = breaks, plot = FALSE)$counts
+    
+    obs_list[[obs_idx]] <- list(
+      species_idx = s,
+      deploy_idx = d,
+      counts = hist_counts,
+      n_det = sum(hist_counts)
+    )
+  }
+}
+
+M <- length(obs_list)
+cat("Total observations (species x deployment):", M, "\n")
+
+# Construct data matrices
+L <- matrix(0, nrow = M, ncol = n_bins)
+species_idx <- integer(M)
+deploy_idx <- integer(M)
+N_obs <- integer(M)
+
+for (m in seq_along(obs_list)) {
+  L[m, ] <- obs_list[[m]]$counts
+  species_idx[m] <- obs_list[[m]]$species_idx
+  deploy_idx[m] <- obs_list[[m]]$deploy_idx
+  N_obs[m] <- obs_list[[m]]$n_det
+}
+
+# Bin midpoints and area weights
+bin_mids <- breaks[-length(breaks)] + BIN_WIDTH / 2
+bin_areas <- (breaks[-1]^2 - breaks[-length(breaks)]^2) / MAX_DIST^2
+
+cat("Bins:", n_bins, "| Bin width:", BIN_WIDTH, "m | Max distance:", MAX_DIST, "m\n")
+cat("Species:", K, "| Deployments:", I, "| Observations:", M, "\n")
+```
+
+## 6.3 Define and run the NIMBLE model
+
+```{r edd-model, results='hide'}
+edd_code <- nimbleCode({
+  # Priors
+  gamma0 ~ dnorm(0, sd = 10)
+  tau_alpha ~ dgamma(0.01, 0.01)
+  sd_alpha <- 1 / sqrt(tau_alpha)
+  tau_delta ~ dgamma(0.01, 0.01)
+  sd_delta <- 1 / sqrt(tau_delta)
+  
+  # Species offsets (K-1 free, Kth derived for sum-to-zero)
+  for (k in 1:(K-1)) {
+    delta_free[k] ~ dnorm(0, sd = sd_delta)
+  }
+  # Sum-to-zero constraint
+  delta[1:(K-1)] <- delta_free[1:(K-1)]
+  delta[K] <- -sum(delta_free[1:(K-1)])
+  
+  # Deployment random effects
+  for (i in 1:I) {
+    alpha[i] ~ dnorm(gamma0, sd = sd_alpha)
+  }
+  
+  # Likelihood
+  for (m in 1:M) {
+    # Detection scale for this species-deployment combination
+    log_sigma[m] <- alpha[deploy_idx[m]] + delta[species_idx[m]]
+    sigma[m] <- exp(log_sigma[m])
+    
+    # Half-normal detection probabilities per bin
+    for (j in 1:n_bins) {
+      p[m, j] <- exp(-bin_mids[j]^2 / (2 * sigma[m]^2))
+      pi_raw[m, j] <- bin_areas[j] * p[m, j]
+    }
+    
+    # Normalize to proper probabilities
+    pi_sum[m] <- sum(pi_raw[m, 1:n_bins])
+    for (j in 1:n_bins) {
+      pi_norm[m, j] <- pi_raw[m, j] / pi_sum[m]
+    }
+    
+    # Multinomial likelihood
+    L[m, 1:n_bins] ~ dmulti(pi_norm[m, 1:n_bins], N_obs[m])
+  }
+})
+
+# Data and constants
+edd_constants <- list(
+  K = K, I = I, M = M, n_bins = n_bins,
+  species_idx = species_idx,
+  deploy_idx = deploy_idx,
+  N_obs = N_obs,
+  bin_mids = bin_mids,
+  bin_areas = bin_areas
+)
+
+edd_data <- list(L = L)
+
+# Initial values
+edd_inits <- list(
+  gamma0 = log(5),
+  tau_alpha = 1,
+  tau_delta = 10,
+  delta_free = rep(0, K - 1),
+  alpha = rep(log(5), I)
+)
+
+# Build and run
+model <- nimbleModel(edd_code, constants = edd_constants,
+                     data = edd_data, inits = edd_inits)
+compiled <- compileNimble(model)
+mcmc_conf <- configureMCMC(model,
+                            monitors = c("gamma0", "alpha", "delta",
+                                         "sd_alpha", "sd_delta",
+                                         "tau_alpha", "tau_delta"))
+mcmc <- buildMCMC(mcmc_conf)
+compiled_mcmc <- compileNimble(mcmc, project = model)
+
+# Run MCMC
+samples <- runMCMC(compiled_mcmc,
+                   niter = 10000,
+                   nburnin = 2000,
+                   thin = 5,
+                   nchains = 2,
+                   setSeed = TRUE)
+```
+
+## 6.4 Extract EDD estimates
+
+```{r edd-extract}
+# Combine chains
+all_samples <- do.call(rbind, samples)
+
+# Extract deployment-level alphas and species deltas
+alpha_cols <- grep("^alpha\\[", colnames(all_samples), value = TRUE)
+delta_cols <- grep("^delta\\[", colnames(all_samples), value = TRUE)
+
+alpha_post <- all_samples[, alpha_cols]
+delta_post <- all_samples[, delta_cols]
+
+# Compute EDD for each species-deployment combination
+# EDD = B * sqrt(sum(p_j * a_j)) where p_j is detection prob at bin j
+edd_estimates <- list()
+
+for (m in seq_len(M)) {
+  s <- species_idx[m]
+  d <- deploy_idx[m]
+  
+  # Posterior of log_sigma for this observation
+  log_sigma_post <- alpha_post[, d] + delta_post[, s]
+  sigma_post <- exp(log_sigma_post)
+  
+  # EDD = sigma * sqrt(pi/2) for half-normal
+  edd_post <- sigma_post * sqrt(pi / 2)
+  
+  edd_estimates[[m]] <- tibble(
+    species = species_list[s],
+    deployment = deploy_list[d],
+    EDD_mean = mean(edd_post),
+    EDD_sd = sd(edd_post),
+    EDD_lcl = quantile(edd_post, 0.025),
+    EDD_ucl = quantile(edd_post, 0.975)
+  )
+}
+
+edd_df <- bind_rows(edd_estimates)
+
+# Summary by species
+edd_by_species <- edd_df %>%
+  group_by(species) %>%
+  summarise(
+    n_deployments = n(),
+    mean_EDD = mean(EDD_mean),
+    sd_EDD = sd(EDD_mean),
+    .groups = "drop"
+  )
+
+cat("EDD estimates by species:\n")
+edd_by_species %>%
+  mutate(across(where(is.numeric) & !matches("n_"), ~round(., 2))) %>%
+  knitr::kable(col.names = c("Species", "Deployments", "Mean EDD (m)", "SD"))
+```
+
+## 6.5 Model diagnostics
+
+```{r edd-diagnostics}
+# Check convergence for key parameters
+cat("Convergence diagnostics:\n")
+cat("  gamma0 Rhat:", round(MCMCsummary(samples, params = "gamma0")$Rhat, 3), "\n")
+cat("  sd_alpha Rhat:", round(MCMCsummary(samples, params = "sd_alpha")$Rhat, 3), "\n")
+
+# Species offsets
+delta_summary <- MCMCsummary(samples, params = "delta")
+cat("\nSpecies offsets (delta):\n")
+delta_table <- tibble(
+  species = species_list,
+  delta_mean = delta_summary$mean,
+  delta_lcl = delta_summary$`2.5%`,
+  delta_ucl = delta_summary$`97.5%`
+)
+delta_table %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  knitr::kable()
+```
+
+# 7. Summary: all parameters
+
+```{r summary-table}
+# Combine all parameter estimates
+final_params <- sbd_results %>%
+  select(species = common_name_clean, n_speed = n,
+         sbd_speed, speed_se = se) %>%
+  full_join(
+    activity_results %>%
+      select(species = common_name_clean, n_activity = n,
+             activity, activity_se = se),
+    by = "species"
+  ) %>%
+  full_join(
+    staying_by_species %>%
+      select(species = common_name_clean, n_staying = n,
+             mean_st_g),
+    by = "species"
+  ) %>%
+  full_join(
+    edd_by_species %>% select(species, n_edd = n_deployments, mean_EDD),
+    by = "species"
+  ) %>%
+  mutate(
+    day_range_km = sbd_speed * activity * 86400 / 1000
+  )
+
+cat("=== COMPLETE PARAMETER ESTIMATES ===\n\n")
+final_params %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  knitr::kable(col.names = c("Species", "n_speed", "SBD Speed (m/s)", "Speed SE",
+                              "n_activity", "Activity", "Activity SE",
+                              "n_staying", "ST_g (s)",
+                              "n_EDD", "EDD (m)", "Day Range (km/d)"))
+```
+
+These parameter estimates are direct inputs for density models:
+
+- **REM** uses: speed, activity (as day range), EDD, camera angle
+- **REST** uses: staying time, detection area (from EDD and camera angle)  
+- **CTDS** uses: EDD, staying time, camera angle
+
+> **Note:** NA values in the summary table indicate species that did not meet minimum sample size requirements for speed (≥10 sequences) or activity (≥40 detections) estimation from this single array. The EDD model and staying time estimation have lower data requirements and typically produce estimates for all detected species. In a full analysis using data from multiple arrays (e.g., the complete study with 181 deployments), most species would have complete parameter sets. Day range can only be calculated when both speed and activity are available.
+
+# References
+
+- Howe EJ et al. 2017. Distance sampling with camera traps. *Methods in Ecology and Evolution* 8: 1558-1565.
+- Nakashima Y et al. 2018. Estimating animal density without individual recognition. *Journal of Applied Ecology* 55: 735-744.
+- Rowcliffe JM et al. 2008. Estimating animal density using camera traps without the need for individual recognition. *Journal of Applied Ecology* 45: 1228-1236.
+- Rowcliffe JM et al. 2014. Quantifying levels of animal activity using camera trap data. *Methods in Ecology and Evolution* 5: 1170-1179.
+- Rowcliffe JM et al. 2016. Wildlife speed cameras: measuring animal travel speed and day range. *Remote Sensing in Ecology and Conservation* 2: 84-94.
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
