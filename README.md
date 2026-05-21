@@ -1,7 +1,5 @@
 # Automated Parameter Estimation for Camera Trap Density Models
 
-[![DOI](https://zenodo.org/badge/DOI/XXXX.svg)](https://doi.org/XXXX)
-
 This repository contains the R code and example data for the automated parameter estimation pipeline described in:
 
 > McMurry, S., Goldstein, B., Alyetam, M., & Kays, R. (in review). Automated Parameter Estimation for Camera Trap Density Models Using Computer Vision-Enhanced Distance Sampling. *Ecological Monographs*.
