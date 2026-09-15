@@ -1,29 +1,38 @@
 # =============================================================================
-# 05_EDD_ESTIMATION.R
+# 05b_EDD_JOINT_ESTIMATION.R
 # Chapter 1: Camera Trap Density Estimation
 # =============================================================================
 #
-# PURPOSE: Estimate Effective Detection Distance (EDD) using NIMBLE model.
-#          Uses SBD speeds, activity, and staying time from previous steps.
+# PURPOSE: Joint multi-species EDD estimation with partial pooling.
 #
-# KEY DECISIONS:
+#   Decomposes the detection scale parameter:
+#     log(σ_ik) = α_i + δ_k
 #
-#   1. TRIGGER PICTURES FOR DETECTION HISTORY
-#      Distance sampling requires one independent detection distance per
-#      detection event. We use the trigger picture (first timestamp of each
-#      sequence) — the moment the animal first entered the viewshed.
-#      Using all burst frames would inflate detection counts and bias the
-#      distance histogram toward longer distances.
+#   where:
+#     α_i = deployment-level random effect (site-level "visibility")
+#     δ_k = species offset (how detectable is species k relative to average?)
 #
-#   2. DPT SCENE DEPTH AS PIXEL_DISTANCE COVARIATE
-#      pixel_distance = scale(log(scene_depth)) from depth_mmm.csv.
-#      This replaces mean detection distance, which was circular (using
-#      detection distance to predict detection range r -> EDD). DPT scene
-#      depth is a genuine environmental covariate reflecting habitat openness
-#      that independently predicts camera detection range.
+#   Scene depth and camera model enter as covariates on the hyperprior:
+#     α_i ~ Normal(γ_0 + γ_1 × pixel_distance_i + γ_cam[cam_model_i], τ_α)
+#
+#   Camera model is categorical (reference-level coding). The first model
+#   (alphabetically) is the reference (γ_cam[1] = 0); additional models get
+#   free offsets. This captures hardware differences in PIR sensitivity,
+#   focal length, and FOV that affect detection range independently of habitat.
+#
+#   Identifiability constraint: sum-to-zero on δ_k
+#     → α_i represents detection range for an "average" species at site i
+#     → δ_k is each species' deviation from that average
+#
+#   The key benefit: data-rich species (deer, bear) at a camera inform the
+#   site effect α_i, which then improves EDD estimates for rare species at
+#   that same camera via partial pooling.
+#
+# DIAGNOSTIC: Compares prior vs posterior on γ_1 (scene depth effect) to
+#             address whether the covariate is informative.
 #
 # INPUT:   Parameter estimates from Steps 2-4, clean data from Step 1
-# OUTPUT:  05_edd_results.rds
+# OUTPUT:  05b_edd_joint_results.rds
 #
 # =============================================================================
 
@@ -36,18 +45,18 @@ library(MCMCvis)
 library(coda)
 
 cat("\n=============================================================\n")
-cat("STEP 05: EDD ESTIMATION\n")
+cat("STEP 05b: JOINT MULTI-SPECIES EDD ESTIMATION\n")
 cat("=============================================================\n\n")
 
 # =============================================================================
-# 1. EDD APPROXIMATION FUNCTION
+# 1. EDD APPROXIMATION FUNCTION (unchanged from 05)
 # =============================================================================
 
-EDD_approx_logmix <- nimbleFunction(run = function(r       = double(0),
-                                                   shape_d = double(0),
-                                                   shape_e = double(0),
+EDD_approx_logmix <- nimbleFunction(run = function(r         = double(0),
+                                                   shape_d   = double(0),
+                                                   shape_e   = double(0),
                                                    increment = double(0),
-                                                   B       = double(0)) {
+                                                   B         = double(0)) {
   points        <- (1:(B/increment)) * increment
   area          <- (points + increment/2)^2 - (points - increment/2)^2
   relative_area <- area / sum(area)
@@ -60,83 +69,114 @@ EDD_approx_logmix <- nimbleFunction(run = function(r       = double(0),
 })
 
 # =============================================================================
-# 2. NIMBLE MODEL CODE
+# 2. JOINT NIMBLE MODEL
+# =============================================================================
+#
+# Observation level: m = 1:M  (one entry per species × deployment with N>0)
+# Deployment level:  i = 1:I  (all deployments)
+# Species level:     k = 1:K  (all species)
+#
+# Each observation m maps to a deployment (deploy_idx[m]) and species
+# (species_idx[m]).
+#
+# The multinomial models the SHAPE of the distance distribution for each
+# species-deployment combo. The Poisson/Binomial layers model total encounter
+# counts. Together they estimate the detection function.
+#
+# NOTE: We separate detection estimation from density estimation. This model
+#       estimates deployment×species EDD only. Density is computed downstream
+#       using EDD posteriors + activity/speed/staying time from Steps 2-4.
 # =============================================================================
 
-model_code <- nimbleCode({
+joint_model_code <- nimbleCode({
   
+  # ---- Species offsets: sum-to-zero constraint ----
+  # K-1 free parameters; Kth is deterministic = -sum(others)
+  for (k in 1:(K_minus_1)) {
+    delta_free[k] ~ dnorm(0, tau_delta)
+    delta[k] <- delta_free[k]
+  }
+  delta[K] <- -sum(delta_free[1:K_minus_1])
+  
+  # ---- Camera model offsets: reference-level coding ----
+  # cam_model_idx[i] = 1 is the reference (gamma_cam[1] = 0)
+  # Additional camera models get free offsets
+  gamma_cam[1] <- 0                          # reference camera model
+  for (c in 2:n_cam_models) {
+    gamma_cam[c] ~ dnorm(0, 0.01)            # offset vs reference model
+  }
+  
+  # ---- Deployment-level random effects ----
+  # Scene depth + camera model enter as covariates on the mean
   for (i in 1:n_deployments) {
-    L[i, 1:n_bins] ~ dmulti(Pi_ij_c[i, 1:n_bins], N_i[i])
-    N_i[i] ~ dbinom(sum_Pi[i], n[i])
-    n[i]   ~ dpois(mu[i])
+    alpha[i] ~ dnorm(gamma_0 + gamma_1 * pixel_distance[i] + gamma_cam[cam_model_idx[i]],
+                     tau_alpha)
+  }
+  
+  # ---- Observation-level: detection model ----
+  # Each observation m is one species at one deployment (with detections > 0)
+  for (m in 1:M) {
+    # Detection scale from deployment effect + species offset
+    log(sigma[m]) <- alpha[deploy_idx[m]] + delta[species_idx[m]]
     
-    log(mu[i]) <- B_0_mu + beta_mu * pixel_distance[i]
-    log(r[i])  <- B_0_r  + beta_r  * pixel_distance[i]
-    
-    E[i]     <- EDD_approx_logmix(r[i], shape_d, shape_e, increment = 0.01, B)
-    A_est[i] <- 0.5 * E[i]^2 * viewshed_angle[i]
-    
+    # Detection probabilities across distance bins
     for (j in 1:n_bins) {
-      P_ij[i, j]  <- exp(-(d_j[j]^2) / (2 * r[i]^2))
-      Pi_ij[i, j] <- psi[j] * P_ij[i, j]
+      P[m, j]  <- exp(-(d_j[j]^2) / (2 * sigma[m]^2))
+      Pi[m, j] <- psi[j] * P[m, j]
     }
-    Pi_ij_c[i, 1:n_bins] <- Pi_ij[i, 1:n_bins] / sum(Pi_ij[i, 1:n_bins])
-    sum_Pi[i]             <- sum(Pi_ij[i, 1:n_bins])
+    Pi_c[m, 1:n_bins] <- Pi[m, 1:n_bins] / sum(Pi[m, 1:n_bins])
+    sum_Pi[m]          <- sum(Pi[m, 1:n_bins])
+    
+    # Multinomial on binned distances
+    L[m, 1:n_bins] ~ dmulti(Pi_c[m, 1:n_bins], N_obs[m])
+    
+    # Encounter count model
+    N_obs[m] ~ dbinom(sum_Pi[m], n_avail[m])
+    n_avail[m] ~ dpois(mu[m])
+    log(mu[m]) <- mu_0 + mu_deploy[deploy_idx[m]] + mu_species[species_idx[m]]
+    
+    # EDD for this species × deployment
+    E[m] <- EDD_approx_logmix(sigma[m], shape_d, shape_e, increment = 0.01, B)
   }
   
+  # ---- Nuisance: encounter rate intercepts ----
+  # These just need to be flexible enough to not constrain the detection model
+  mu_0 ~ dnorm(0, 0.01)
   for (i in 1:n_deployments) {
-    y_plot[i] ~ dpois(mu_plot[i])
-    log(mu_plot[i]) <- log(D_plot[i]) + log(A_est[i]) +
-      log(p_active * T[i]) - log(s_mean)
-    
-    y_move[i] ~ dpois(mu_move[i])
-    log(mu_move[i]) <- log(D_move[i]) +
-      log(E[i] * (2 + viewshed_angle[i]) * p_active * T[i]) +
-      log(v) - log(3.14)
-    
-    D_plot[i] <- exp(B_0_D_p + beta_d_p * pixel_distance[i]) / 1e6
-    D_move[i] <- exp(B_0_D_m + beta_d_m * pixel_distance[i]) / 1e6
+    mu_deploy[i] ~ dnorm(0, tau_mu_deploy)
   }
+  for (k in 1:K) {
+    mu_species[k] ~ dnorm(0, tau_mu_species)
+  }
+  tau_mu_deploy  ~ dgamma(0.01, 0.01)
+  tau_mu_species ~ dgamma(0.01, 0.01)
   
-  D_plot_mean <- exp(B_0_D_p + beta_d_p * mean_pixel_dist)
-  D_move_mean <- exp(B_0_D_m + beta_d_m * mean_pixel_dist)
+  # ---- Priors ----
+  gamma_0   ~ dnorm(0, 0.01)    # intercept for deployment effect (precision=0.01 → SD=10)
+  gamma_1   ~ dnorm(0, 0.01)    # scene depth slope — KEY diagnostic param
+  # gamma_cam[c] priors defined above (reference-level coding)
+  tau_alpha  ~ dgamma(0.01, 0.01)   # precision of deployment effects
+  tau_delta  ~ dgamma(0.01, 0.01)   # precision of species offsets
+  shape_d   ~ dunif(0, 10)      # logistic shoulder shape
+  shape_e   ~ dunif(0, 10)      # logistic shoulder midpoint
   
-  # Priors
-  B_0_mu   ~ dnorm(0, 0.01)
-  beta_mu  ~ dnorm(0, 0.01)
-  B_0_r    ~ dnorm(0, 0.01)
-  beta_r   ~ dnorm(0, 0.01)
-  B_0_D_p  ~ dnorm(0, 0.01)
-  B_0_D_m  ~ dnorm(0, 0.01)
-  beta_d_p ~ dnorm(0, 0.01)
-  beta_d_m ~ dnorm(0, 0.01)
-  shape_d  ~ dunif(0, 10)
-  shape_e  ~ dunif(0, 10)
+  # ---- Derived quantities ----
+  sd_alpha <- 1 / sqrt(tau_alpha)
+  sd_delta <- 1 / sqrt(tau_delta)
 })
 
 # =============================================================================
-# 3. HELPER FUNCTIONS
+# 3. HELPER FUNCTIONS (carried from 05)
 # =============================================================================
 
 count_breaks_distance <- function(dist_breaks, dist) {
   result <- numeric(length(dist_breaks) - 1)
   for (i in seq_along(dist)) {
-    w <- which(dist_breaks > dist[i])
+    w   <- which(dist_breaks > dist[i])
     bin <- if (length(w) == 0) length(dist_breaks) - 1 else min(w) - 1
     result[bin] <- result[bin] + 1
   }
   return(result)
-}
-
-construct_dethist_array <- function(datlist, dist_breaks) {
-  y_array <- matrix(0, nrow = nrow(datlist$deployments_df),
-                    ncol = length(dist_breaks) - 1)
-  for (i in 1:nrow(datlist$deployments_df)) {
-    this_dets    <- datlist$individual_dets_df %>%
-      filter(deployment_id == datlist$deployments_df$deployment_id[i])
-    y_array[i, ] <- count_breaks_distance(dist_breaks, this_dets$distance)
-  }
-  return(y_array)
 }
 
 parse_angle <- function(angle_str) {
@@ -175,15 +215,14 @@ species_params <- sbd_results$sbd_results %>%
   ) %>%
   filter(!is.na(sbd_speed) & !is.na(activity_level) & !is.na(staying_time))
 
-cat("  - Species with complete parameters:", nrow(species_params), "\n")
+cat("  Species with complete parameters:", nrow(species_params), "\n")
 print(species_params)
-cat("\n")
 
 # =============================================================================
-# 5. LOAD TECH SPECS AND DEPLOYMENTS
+# 5. LOAD TECH SPECS, DEPLOYMENTS, AND SCENE DEPTH
 # =============================================================================
 
-cat("Loading tech specs and deployment data...\n")
+cat("\nLoading deployment metadata...\n")
 
 tech_specs_sub <- read.csv(paste0(DATA_DIR, "1_raw/AI/tech_specs.csv"),
                            stringsAsFactors = FALSE) %>%
@@ -202,27 +241,15 @@ deployments <- read.csv(WI_FILES$deployments, stringsAsFactors = FALSE) %>%
   ) %>%
   distinct(deployment_id, .keep_all = TRUE)
 
-cat("  - Tech specs:", nrow(tech_specs_sub), "camera types\n")
-cat("  - Deployments:", nrow(deployments), "\n")
-
-# =============================================================================
-# 5b. DPT SCENE DEPTH COVARIATE
-# =============================================================================
-
+# Scene depth covariate
 DEPTH_FILE <- paste0(DATA_DIR, "1_raw/AI/depth_mmm.csv")
 if (file.exists(DEPTH_FILE)) {
   depth_cal <- read.csv(DEPTH_FILE, stringsAsFactors = FALSE) %>%
     select(deployment_id, scene_depth = mean)
-  cat("  - DPT scene depth loaded:", nrow(depth_cal), "deployments\n\n")
+  cat("  DPT scene depth loaded:", nrow(depth_cal), "deployments\n")
 } else {
-  depth_cal <- NULL
-  cat("  WARNING: depth_mmm.csv not found — falling back to mean detection\n")
-  cat("  distance (circular — flag in methods if used)\n\n")
+  stop("depth_mmm.csv not found — joint model requires DPT scene depth")
 }
-
-# =============================================================================
-# 6. SURVEY EFFORT
-# =============================================================================
 
 survey_effort <- deployments %>%
   mutate(
@@ -231,17 +258,13 @@ survey_effort <- deployments %>%
   ) %>%
   filter(effort_secs > 0)
 
-cat("Survey effort:", nrow(survey_effort), "deployments with valid effort\n\n")
-
 # =============================================================================
-# 7. EXTRACT TRIGGER PICTURES
+# 6. BUILD JOINT TRIGGER PICTURE DATASET (ALL SPECIES)
 # =============================================================================
-# Use the first frame of each sequence (trigger picture) as the detection
-# distance for the detection history. Avoids inflating counts from burst
-# photography and matches the independent-detection assumption of distance
-# sampling.
+# Key change from 05: instead of looping over species and subsetting, we
+# build one combined dataset and index by species and deployment.
 
-cat("Extracting trigger pictures...\n")
+cat("\nBuilding joint trigger picture dataset...\n")
 
 data <- data %>%
   mutate(
@@ -251,284 +274,497 @@ data <- data %>%
   left_join(deployments %>% select(deployment_id, start_date), by = "deployment_id") %>%
   filter(as.Date(timestamp_clean) != start_date)   # remove calibration frames
 
-cat("  - Records after removing start date:", nrow(data), "\n")
-
-# Viewshed angles per deployment
-viewshed_angles <- data %>%
-  select(deployment_id, camera_name_clean) %>%
-  distinct() %>%
-  left_join(tech_specs_sub %>% select(camera_name_clean, angle_numeric),
-            by = "camera_name_clean") %>%
-  mutate(
-    viewshed_angle_deg = ifelse(is.na(angle_numeric), 30, angle_numeric),
-    viewshed_angle     = (viewshed_angle_deg / 360) * (2 * pi)
-  )
-
-# Sort by frame number — consistent with 02_sbd_speed.R
+# Sort by frame number, collapse to 1-point-per-second, take trigger picture
 data <- data %>%
   mutate(frame_number = as.numeric(str_extract(filename, "\\d+"))) %>%
   arrange(sequence_id_use, frame_number)
 
-# 1-point-per-second: first frame per unique timestamp
 data_collapsed <- data %>%
   group_by(sequence_id_use, timestamp_clean) %>%
   slice(1) %>%
   ungroup()
 
-# Trigger picture = first timestamp of each sequence
-trigger_pictures <- data_collapsed %>%
+trigger_all <- data_collapsed %>%
   group_by(sequence_id_use) %>%
   slice(1) %>%
   ungroup() %>%
-  mutate(distance = as.numeric(world_z))
+  mutate(distance = as.numeric(world_z)) %>%
+  filter(common_name_clean %in% species_params$species)
 
-cat("  - Total trigger pictures:", nrow(trigger_pictures), "\n\n")
-stopifnot(n_distinct(trigger_pictures$sequence_id_use) == nrow(trigger_pictures))
+cat("  Total trigger pictures across all species:", nrow(trigger_all), "\n")
+cat("  Species represented:", n_distinct(trigger_all$common_name_clean), "\n")
+cat("  Deployments represented:", n_distinct(trigger_all$deployment_id), "\n")
+
+# Species and deployment lookup tables
+species_list    <- sort(unique(trigger_all$common_name_clean))
+K               <- length(species_list)
+species_lookup  <- setNames(1:K, species_list)
+
+deploy_list     <- sort(unique(trigger_all$deployment_id))
+n_deployments_total <- length(deploy_list)
+deploy_lookup   <- setNames(1:n_deployments_total, deploy_list)
+
+cat("\n  Species (K =", K, "):\n")
+for (k in 1:K) cat("    ", k, ":", species_list[k], "\n")
+cat("\n  Deployments (I =", n_deployments_total, ")\n")
 
 # =============================================================================
-# 8. RUN EDD ANALYSIS FOR ALL SPECIES
+# 7. COMMON DISTANCE BINS
+# =============================================================================
+# One bin structure shared across all species. B = global max detection distance.
+
+break_width_m  <- 3
+B_global       <- ceiling(max(trigger_all$distance, na.rm = TRUE) / break_width_m) * break_width_m
+dist_breaks_m  <- seq(0, B_global, by = break_width_m)
+dist_midpoints <- dist_breaks_m[-length(dist_breaks_m)] + break_width_m / 2
+n_bins         <- length(dist_midpoints)
+
+total_area <- pi * B_global^2
+psi <- sapply(1:(length(dist_breaks_m) - 1), function(i)
+  (dist_breaks_m[i+1]^2 - dist_breaks_m[i]^2) / total_area)
+
+cat("  Max detection distance (B):", B_global, "m\n")
+cat("  Number of distance bins:", n_bins, "\n\n")
+
+# =============================================================================
+# 8. BUILD OBSERVATION-LEVEL DATA (LONG FORMAT)
+# =============================================================================
+# Each "observation" m = one species × deployment combination with N_ik > 0.
+# This replaces the per-species loop + separate L matrix from 05.
+
+cat("Building observation-level detection histograms...\n")
+
+# Identify all species × deployment combos with detections
+obs_combos <- trigger_all %>%
+  group_by(deployment_id, common_name_clean) %>%
+  summarise(
+    N_detections = n(),
+    .groups      = "drop"
+  ) %>%
+  filter(N_detections > 0) %>%
+  mutate(
+    deploy_idx  = deploy_lookup[deployment_id],
+    species_idx = species_lookup[common_name_clean]
+  ) %>%
+  arrange(deploy_idx, species_idx)
+
+M <- nrow(obs_combos)
+cat("  Observation-level entries (M):", M, "\n")
+cat("  (= species × deployment combos with detections)\n\n")
+
+# Build the detection histogram matrix L[m, j]
+L_matrix <- matrix(0, nrow = M, ncol = n_bins)
+
+for (m in 1:M) {
+  this_dep <- obs_combos$deployment_id[m]
+  this_sp  <- obs_combos$common_name_clean[m]
+  
+  dists <- trigger_all %>%
+    filter(deployment_id == this_dep, common_name_clean == this_sp) %>%
+    pull(distance)
+  
+  L_matrix[m, ] <- count_breaks_distance(dist_breaks_m, dists)
+}
+
+# Verify row sums match N_detections
+stopifnot(all(rowSums(L_matrix) == obs_combos$N_detections))
+cat("  Detection histogram verified: row sums match N_detections\n")
+
+# =============================================================================
+# 9. DEPLOYMENT-LEVEL COVARIATE
 # =============================================================================
 
-all_species           <- species_params$species
-all_edd_by_deployment <- list()
+deploy_data <- tibble(deployment_id = deploy_list) %>%
+  left_join(depth_cal, by = "deployment_id") %>%
+  left_join(
+    trigger_all %>%
+      select(deployment_id, camera_name) %>%
+      mutate(camera_name_clean = toupper(str_trim(camera_name))) %>%
+      distinct(deployment_id, .keep_all = TRUE),
+    by = "deployment_id"
+  ) %>%
+  mutate(
+    scene_depth    = ifelse(is.na(scene_depth),
+                            median(scene_depth, na.rm = TRUE), scene_depth),
+    pixel_distance = as.numeric(scale(log(scene_depth))),
+    pixel_distance = ifelse(is.na(pixel_distance), 0, pixel_distance)
+  )
 
-cat("Starting EDD analysis for", length(all_species), "species...\n\n")
+# Camera model categorical index
+# Collapse to brand level (e.g., "BROWNING ELITE HP5" → "BROWNING")
+# This captures the meaningful hardware differences (PIR sensor, focal length)
+# without overfitting to rare model variants with few deployments.
+deploy_data <- deploy_data %>%
+  mutate(
+    camera_brand = case_when(
+      str_detect(camera_name_clean, "BROWNING") ~ "BROWNING",
+      str_detect(camera_name_clean, "RECONYX")  ~ "RECONYX",
+      TRUE ~ NA_character_  # flag unrecognized names for imputation below
+    )
+  )
 
-for (SPECIES_TO_ANALYZE in all_species) {
+# If camera_brand is missing (unrecognized name or NA), assign to most common brand
+n_missing_brand <- sum(is.na(deploy_data$camera_brand))
+if (n_missing_brand > 0) {
+  most_common_brand <- names(sort(table(deploy_data$camera_brand), decreasing = TRUE))[1]
+  bad_names <- unique(deploy_data$camera_name_clean[is.na(deploy_data$camera_brand)])
+  cat("  WARNING:", n_missing_brand, "deployments with unrecognized camera name(s):",
+      paste(bad_names, collapse = ", "), "\n")
+  cat("           Assigning to most common brand:", most_common_brand, "\n")
+  deploy_data$camera_brand[is.na(deploy_data$camera_brand)] <- most_common_brand
+}
+
+cam_model_list  <- sort(unique(deploy_data$camera_brand))
+n_cam_models    <- length(cam_model_list)
+cam_model_lookup <- setNames(1:n_cam_models, cam_model_list)
+
+deploy_data <- deploy_data %>%
+  mutate(cam_model_idx = cam_model_lookup[camera_brand])
+
+cat("  pixel_distance: scale(log(scene_depth)) from DPT\n")
+cat("  Range:", round(min(deploy_data$pixel_distance), 2), "to",
+    round(max(deploy_data$pixel_distance), 2), "\n")
+cat("  Camera brands (n =", n_cam_models, "):\n")
+for (c in 1:n_cam_models) {
+  n_deps <- sum(deploy_data$cam_model_idx == c)
+  ref_tag <- ifelse(c == 1, " [REFERENCE]", "")
+  cat("    ", c, ":", cam_model_list[c], "(", n_deps, "deployments)", ref_tag, "\n")
+}
+cat("\n")
+
+# =============================================================================
+# 10. DETECTION SUMMARY BY SPECIES × DEPLOYMENT
+# =============================================================================
+
+cat("Detection counts per species:\n")
+trigger_all %>%
+  group_by(common_name_clean) %>%
+  summarise(
+    n_triggers    = n(),
+    n_deployments = n_distinct(deployment_id),
+    .groups       = "drop"
+  ) %>%
+  arrange(desc(n_triggers)) %>%
+  print(n = 20)
+cat("\n")
+
+# =============================================================================
+# 11. ASSEMBLE NIMBLE DATA AND CONSTANTS
+# =============================================================================
+
+cat("Assembling NIMBLE inputs...\n\n")
+
+nimble_data <- list(
+  L              = L_matrix,
+  N_obs          = obs_combos$N_detections,
+  pixel_distance = deploy_data$pixel_distance,
+  d_j            = dist_midpoints,
+  psi            = psi
+)
+
+nimble_constants <- list(
+  M              = M,
+  n_deployments  = n_deployments_total,
+  K              = K,
+  K_minus_1      = K - 1,
+  n_cam_models   = n_cam_models,
+  cam_model_idx  = deploy_data$cam_model_idx,
+  n_bins         = n_bins,
+  B              = B_global,
+  deploy_idx     = obs_combos$deploy_idx,
+  species_idx    = obs_combos$species_idx
+)
+
+# Initial values
+# NOTE: gamma_cam[1] is deterministic (=0, reference level), so don't init it.
+#       Only init gamma_cam[2:n_cam_models] if n_cam_models > 1.
+gamma_cam_init <- rep(0, n_cam_models)
+nimble_inits <- list(
+  gamma_0        = log(10),          # ~10m baseline detection range
+  gamma_1        = 0.2,              # slight positive scene depth effect
+  gamma_cam      = gamma_cam_init,   # camera model offsets (idx 1 ignored by model)
+  tau_alpha      = 1,
+  tau_delta      = 1,
+  tau_mu_deploy  = 1,
+  tau_mu_species = 1,
+  mu_0           = 3,
+  shape_d        = 1,
+  shape_e        = 1,
+  alpha          = rep(log(10), n_deployments_total),
+  delta_free     = rep(0, K - 1),
+  mu_deploy      = rep(0, n_deployments_total),
+  mu_species     = rep(0, K),
+  n_avail        = obs_combos$N_detections * 2
+)
+
+# =============================================================================
+# 12. BUILD AND RUN MODEL
+# =============================================================================
+
+cat("Building NIMBLE model...\n")
+
+# Parameters to monitor
+monitors <- c(
+  "E",                          # deployment×species EDD (primary output)
+  "alpha",                      # deployment effects
+  "delta",                      # species offsets (including derived Kth)
+  "gamma_0", "gamma_1",         # hyperprior params (gamma_1 = scene depth diagnostic)
+  "gamma_cam",                  # camera model offsets
+  "tau_alpha", "tau_delta",     # precisions
+  "sd_alpha", "sd_delta",       # standard deviations (derived)
+  "sigma",                      # detection scale per observation
+  "shape_d", "shape_e"          # logistic shoulder params
+)
+
+tryCatch({
+  
+  model         <- nimbleModel(code = joint_model_code, data = nimble_data,
+                               constants = nimble_constants, inits = nimble_inits)
+  compiled_mod  <- compileNimble(model)
+  mcmc_conf     <- configureMCMC(model, monitors = monitors)
+  mcmc          <- buildMCMC(mcmc_conf)
+  compiled_mcmc <- compileNimble(mcmc, project = model)
+  
+  # ---- Quick diagnostic run first ----
+  cat("\n--- DIAGNOSTIC RUN (short) ---\n")
+  samples_diag <- runMCMC(compiled_mcmc,
+                          niter   = 2000,
+                          nburnin = 500,
+                          thin    = 5,
+                          nchains = 2,
+                          samplesAsCodaMCMC = TRUE)
+  
+  diag_summary <- MCMCsummary(samples_diag, params = c("gamma_0", "gamma_1",
+                                                        "gamma_cam",
+                                                        "sd_alpha", "sd_delta"))
+  cat("\nDiagnostic run — key parameters:\n")
+  print(diag_summary)
+  cat("\nCheck: are gamma_1 and sd_alpha reasonable? If so, proceed to full run.\n")
+  cat("If gamma_1 is stuck at 0 or sd_alpha is huge, something is wrong.\n\n")
+  
+  # ---- Full production run ----
+  cat("--- FULL PRODUCTION RUN ---\n")
+  samples_raw <- runMCMC(compiled_mcmc,
+                         niter   = 20000,
+                         nburnin = 5000,
+                         thin    = 10,
+                         nchains = 2,
+                         samplesAsCodaMCMC = TRUE)
+  
+  posterior_sum <- MCMCsummary(samples_raw)
+  
+  # =============================================================================
+  # 13. SCENE DEPTH COVARIATE DIAGNOSTIC
+  # =============================================================================
+  # Roland's request: "report how useful the prior was"
+  # Compare prior vs posterior for gamma_1
   
   cat("\n##############################################\n")
-  cat("ANALYZING:", SPECIES_TO_ANALYZE, "\n")
+  cat("SCENE DEPTH COVARIATE DIAGNOSTIC\n")
   cat("##############################################\n\n")
   
-  params   <- species_params[species_params$species == SPECIES_TO_ANALYZE, ]
-  s_mean   <- params$staying_time
-  p_active <- params$activity_level
-  v_sbd    <- params$sbd_speed
+  gamma1_summary <- MCMCsummary(samples_raw, params = "gamma_1")
+  cat("gamma_1 (scene depth effect on deployment detection range):\n")
+  print(gamma1_summary)
   
-  cat("SBD Speed:    ", round(v_sbd, 3), "m/s\n")
-  cat("Activity:     ", round(p_active, 3), "\n")
-  cat("Staying Time: ", round(s_mean, 1), "s\n")
+  # Extract posterior samples for gamma_1
+  gamma1_samples <- MCMCchains(samples_raw, params = "gamma_1")
   
-  data_species <- trigger_pictures %>%
-    filter(common_name_clean == SPECIES_TO_ANALYZE)
+  # Prior: gamma_1 ~ Normal(0, precision=0.01) → SD = 10
+  prior_sd   <- sqrt(1/0.01)
+  prior_mean <- 0
   
-  if (nrow(data_species) == 0) { cat("No data — SKIPPING\n"); next }
-  cat("Trigger detections:", nrow(data_species), "\n")
+  cat("\n  Prior:     Normal(", prior_mean, ",", prior_sd, ")\n")
+  cat("  Posterior: mean =", round(gamma1_summary[, "mean"], 4),
+      ", SD =", round(gamma1_summary[, "sd"], 4), "\n")
+  cat("  95% CI:   [", round(gamma1_summary[, "2.5%"], 4), ",",
+      round(gamma1_summary[, "97.5%"], 4), "]\n\n")
   
-  datlist <- list(
-    deployments_df     = data_species %>% select(deployment_id) %>% distinct(),
-    individual_dets_df = data_species %>% select(deployment_id, distance)
-  )
+  # Is the posterior substantially narrower than the prior?
+  precision_gain <- prior_sd / gamma1_summary[, "sd"]
+  cat("  Precision gain (prior SD / posterior SD):", round(precision_gain, 1), "x\n")
   
-  n_deployments <- nrow(datlist$deployments_df)
-  cat("Deployments:", n_deployments, "\n")
-  if (n_deployments < 3) { cat("Too few deployments — SKIPPING\n"); next }
+  # Does 95% CI exclude zero?
+  ci_excludes_zero <- (gamma1_summary[, "2.5%"] > 0) | (gamma1_summary[, "97.5%"] < 0)
+  cat("  95% CI excludes zero:", ci_excludes_zero, "\n")
   
-  # Distance bins
-  break_width_m  <- 3
-  max_distance_m <- ceiling(max(data_species$distance, na.rm = TRUE) /
-                              break_width_m) * break_width_m
-  dist_breaks_m  <- seq(0, max_distance_m, by = break_width_m)
-  dist_midpoints <- dist_breaks_m[-length(dist_breaks_m)] + break_width_m / 2
-  
-  total_area <- pi * max_distance_m^2
-  psi <- sapply(1:(length(dist_breaks_m) - 1), function(i)
-    (dist_breaks_m[i+1]^2 - dist_breaks_m[i]^2) / total_area)
-  
-  dethist_array <- construct_dethist_array(datlist, dist_breaks_m)
-  L_matrix      <- matrix(0, nrow = nrow(dethist_array), ncol = length(dist_midpoints))
-  for (i in seq_len(nrow(L_matrix))) L_matrix[i, ] <- as.vector(dethist_array[i, ])
-  
-  # Build detection_data with pixel_distance covariate
-  # DPT scene depth preferred; falls back to mean_det_dist if unavailable
-  detection_data <- datlist$deployments_df %>%
-    left_join(survey_effort, by = "deployment_id") %>%
-    left_join(
-      data_species %>%
-        group_by(deployment_id) %>%
-        summarise(mean_det_dist = mean(distance, na.rm = TRUE), .groups = "drop"),
-      by = "deployment_id"
-    )
-  
-  if (!is.null(depth_cal)) {
-    detection_data <- detection_data %>%
-      left_join(depth_cal, by = "deployment_id") %>%
-      mutate(
-        scene_depth    = ifelse(is.na(scene_depth),
-                                median(scene_depth, na.rm = TRUE), scene_depth),
-        pixel_distance = as.numeric(scale(log(scene_depth))),
-        pixel_distance = ifelse(is.na(pixel_distance), 0, pixel_distance)
-      )
-    cat("  pixel_distance: scale(log(scene_depth)) from DPT\n")
+  if (ci_excludes_zero) {
+    direction <- ifelse(gamma1_summary[, "mean"] > 0, "positive", "negative")
+    cat("  → Scene depth has a", direction, "effect on detection range.\n")
+    cat("    Cameras with greater scene depth (more open habitat) have",
+        ifelse(direction == "positive", "LARGER", "SMALLER"), "detection range.\n")
   } else {
-    detection_data <- detection_data %>%
-      mutate(
-        pixel_distance = as.numeric(scale(log(mean_det_dist))),
-        pixel_distance = ifelse(is.na(pixel_distance), 0, pixel_distance)
-      )
-    cat("  NOTE: pixel_distance using mean_det_dist fallback (circular)\n")
+    cat("  → Scene depth effect is not clearly distinguishable from zero.\n")
+    cat("    The covariate may have limited influence on detection range.\n")
   }
   
-  if (nrow(detection_data) != nrow(L_matrix)) { cat("Row mismatch — SKIPPING\n"); next }
+  # Also report deployment-level variance (how much variation does scene depth explain?)
+  cat("\n  Deployment random effect SD (sd_alpha):\n")
+  print(MCMCsummary(samples_raw, params = "sd_alpha"))
+  cat("  Species offset SD (sd_delta):\n")
+  print(MCMCsummary(samples_raw, params = "sd_delta"))
   
-  detection_data$N_i <- rowSums(L_matrix)
+  # =============================================================================
+  # 13b. CAMERA MODEL COVARIATE DIAGNOSTIC
+  # =============================================================================
   
-  density_data_aligned <- detection_data %>%
-    select(deployment_id) %>%
-    left_join(
-      data_species %>%
-        group_by(deployment_id) %>%
-        summarise(y_plot = n_distinct(sequence_id_use),
-                  y_move = n_distinct(sequence_id_use),
-                  .groups = "drop"),
-      by = "deployment_id"
-    ) %>%
-    mutate(y_plot = ifelse(is.na(y_plot), 0, y_plot),
-           y_move = ifelse(is.na(y_move), 0, y_move))
+  cat("\n##############################################\n")
+  cat("CAMERA MODEL COVARIATE DIAGNOSTIC\n")
+  cat("##############################################\n\n")
   
-  viewshed_aligned <- detection_data %>%
-    left_join(viewshed_angles, by = "deployment_id") %>%
-    mutate(viewshed_angle = ifelse(is.na(viewshed_angle),
-                                   (30/360) * 2 * pi, viewshed_angle)) %>%
-    pull(viewshed_angle)
+  gamma_cam_summary <- MCMCsummary(samples_raw, params = "gamma_cam")
+  cat("gamma_cam (camera model effects on deployment detection range):\n")
+  cat("  Reference model (index 1):", cam_model_list[1], "= 0 (fixed)\n\n")
   
-  nimble_data <- list(
-    L              = dethist_array,
-    N_i            = detection_data$N_i,
-    pixel_distance = detection_data$pixel_distance,
-    d_j            = dist_midpoints,
-    y_plot         = density_data_aligned$y_plot,
-    y_move         = density_data_aligned$y_move,
-    T              = detection_data$effort_secs,
-    psi            = psi,
-    viewshed_angle = viewshed_aligned
-  )
-  
-  nimble_constants <- list(
-    n_deployments   = nrow(detection_data),
-    n_bins          = length(dist_midpoints),
-    B               = max_distance_m,
-    v               = v_sbd,
-    mean_pixel_dist = mean(detection_data$pixel_distance),
-    s_mean          = s_mean,
-    p_active        = p_active
-  )
-  
-  nimble_inits <- list(
-    B_0_mu   = 5,
-    B_0_r    = log(10),
-    beta_mu  = 0.2,
-    beta_r   = 0.5,
-    B_0_D_p  = log(10),
-    beta_d_p = 0,
-    B_0_D_m  = log(10),
-    beta_d_m = 0.2,
-    shape_d  = 1,
-    shape_e  = 1,
-    n        = detection_data$N_i * 2
-  )
-  
-  tryCatch({
-    model         <- nimbleModel(code = model_code, data = nimble_data,
-                                 constants = nimble_constants, inits = nimble_inits)
-    compiled_mod  <- compileNimble(model)
-    mcmc_conf     <- configureMCMC(model, monitors = c("E"))
-    mcmc          <- buildMCMC(mcmc_conf)
-    compiled_mcmc <- compileNimble(mcmc, project = model)
-    
-    cat("Running MCMC...\n")
-    samples_raw <- runMCMC(compiled_mcmc,
-                           niter   = 20000,
-                           nburnin = 5000,
-                           thin    = 10,
-                           nchains = 2,
-                           samplesAsCodaMCMC = TRUE)
-    
-    posterior_sum <- MCMCsummary(samples_raw)
-    E_rows        <- grep("^E\\[", rownames(posterior_sum))
-    
-    if (length(E_rows) > 0) {
-      E_values <- posterior_sum[E_rows, ]
-      
-      edd_by_deployment <- data.frame(
-        deployment_id  = detection_data$deployment_id,
-        Species        = SPECIES_TO_ANALYZE,
-        SBD_Speed      = v_sbd,
-        Activity       = p_active,
-        Staying_Time   = s_mean,
-        EDD_mean       = E_values[, "mean"],
-        EDD_sd         = E_values[, "sd"],
-        EDD_2.5        = E_values[, "2.5%"],
-        EDD_97.5       = E_values[, "97.5%"],
-        N_detections   = detection_data$N_i,
-        pixel_distance = detection_data$pixel_distance,
-        mean_det_dist  = detection_data$mean_det_dist,
-        stringsAsFactors = FALSE
-      )
-      
-      cat("\nEDD by deployment:", nrow(edd_by_deployment), "deployments\n")
-      cat("EDD range:", round(min(edd_by_deployment$EDD_mean), 2), "-",
-          round(max(edd_by_deployment$EDD_mean), 2), "m\n")
-      cat("Mean EDD:", round(mean(E_values[, "mean"], na.rm = TRUE), 2), "m\n")
-      
-      all_edd_by_deployment[[SPECIES_TO_ANALYZE]] <- edd_by_deployment
-      
+  for (c in 1:n_cam_models) {
+    cat("  Camera model", c, "(", cam_model_list[c], "):")
+    if (c == 1) {
+      cat(" 0.000 [reference]\n")
     } else {
-      cat("WARNING: No EDD values extracted — check model convergence\n")
+      cat(" mean =", round(gamma_cam_summary[c, "mean"], 4),
+          ", 95% CI [", round(gamma_cam_summary[c, "2.5%"], 4), ",",
+          round(gamma_cam_summary[c, "97.5%"], 4), "]\n")
+      cam_ci_excludes_zero <- (gamma_cam_summary[c, "2.5%"] > 0) |
+                              (gamma_cam_summary[c, "97.5%"] < 0)
+      if (cam_ci_excludes_zero) {
+        cam_dir <- ifelse(gamma_cam_summary[c, "mean"] > 0, "LARGER", "SMALLER")
+        cat("    → Significantly different from reference;", cam_dir,
+            "detection range\n")
+      } else {
+        cat("    → Not significantly different from reference\n")
+      }
     }
+  }
+  cat("\n  On the exp scale, a gamma_cam offset of X means detection scale is\n")
+  cat("  exp(X) times the reference model.\n")
+  
+  # =============================================================================
+  # 14. EXTRACT EDD RESULTS
+  # =============================================================================
+  
+  cat("\n##############################################\n")
+  cat("EXTRACTING EDD RESULTS\n")
+  cat("##############################################\n\n")
+  
+  E_rows <- grep("^E\\[", rownames(posterior_sum))
+  
+  if (length(E_rows) == M) {
+    E_values <- posterior_sum[E_rows, ]
     
-  }, error = function(e) {
-    cat("ERROR:", conditionMessage(e), "\n")
-  })
-}
-
-# =============================================================================
-# 9. COMPILE AND SAVE RESULTS
-# =============================================================================
-
-cat("\n\n##############################################\n")
-cat("COMPILING EDD RESULTS\n")
-cat("##############################################\n\n")
-
-if (length(all_edd_by_deployment) > 0) {
+    edd_by_obs <- obs_combos %>%
+      mutate(
+        EDD_mean  = E_values[, "mean"],
+        EDD_sd    = E_values[, "sd"],
+        EDD_2.5   = E_values[, "2.5%"],
+        EDD_97.5  = E_values[, "97.5%"]
+      )
+    
+    cat("EDD estimates for", M, "species × deployment combinations\n\n")
+    
+    # Summary by species
+    edd_species_summary <- edd_by_obs %>%
+      group_by(common_name_clean) %>%
+      summarise(
+        N_Deployments = n(),
+        N_Detections  = sum(N_detections),
+        Mean_EDD      = round(mean(EDD_mean), 2),
+        SD_EDD        = round(sd(EDD_mean), 2),
+        Min_EDD       = round(min(EDD_mean), 2),
+        Max_EDD       = round(max(EDD_mean), 2),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(N_Detections))
+    
+    cat("=== EDD SUMMARY BY SPECIES (joint model) ===\n")
+    print(edd_species_summary, n = 20)
+    
+    # Species offsets (delta)
+    cat("\n=== SPECIES OFFSETS (delta_k) ===\n")
+    cat("Positive = detected at greater range than average; Negative = shorter range\n\n")
+    delta_rows <- grep("^delta\\[", rownames(posterior_sum))
+    delta_summary <- posterior_sum[delta_rows, ]
+    delta_df <- data.frame(
+      species = species_list,
+      delta_mean = round(delta_summary[, "mean"], 3),
+      delta_sd   = round(delta_summary[, "sd"], 3),
+      delta_2.5  = round(delta_summary[, "2.5%"], 3),
+      delta_97.5 = round(delta_summary[, "97.5%"], 3)
+    ) %>% arrange(desc(delta_mean))
+    print(delta_df)
+    
+  } else {
+    cat("WARNING: Expected", M, "E values but found", length(E_rows), "\n")
+    edd_by_obs         <- NULL
+    edd_species_summary <- NULL
+    delta_df           <- NULL
+  }
   
-  edd_all_species <- do.call(rbind, all_edd_by_deployment)
+  # =============================================================================
+  # 15. SAVE RESULTS
+  # =============================================================================
   
-  edd_summary <- edd_all_species %>%
-    group_by(Species) %>%
-    summarise(
-      N_Deployments = n(),
-      N_Detections  = sum(N_detections),
-      SBD_Speed     = first(SBD_Speed),
-      Activity      = first(Activity),
-      Staying_Time  = first(Staying_Time),
-      Mean_EDD      = round(mean(EDD_mean), 2),
-      SD_EDD        = round(sd(EDD_mean),   2),
-      Min_EDD       = round(min(EDD_mean),  2),
-      Max_EDD       = round(max(EDD_mean),  2),
-      .groups = "drop"
-    )
+  cat("\n\nSaving results...\n")
   
-  cat("=== EDD SUMMARY BY SPECIES ===\n")
-  print(edd_summary)
+  output_rds <- paste0(OUTPUT_DIRS$processed, "05b_edd_joint_results.rds")
+  saveRDS(list(
+    # EDD estimates
+    edd_by_obs          = edd_by_obs,
+    edd_species_summary = edd_species_summary,
+    
+    # Model structure info
+    species_list   = species_list,
+    species_lookup = species_lookup,
+    deploy_list    = deploy_list,
+    deploy_lookup  = deploy_lookup,
+    obs_combos     = obs_combos,
+    
+    # Camera model info
+    cam_model_list   = cam_model_list,
+    cam_model_lookup = cam_model_lookup,
+    deploy_cam_model = deploy_data %>% select(deployment_id, camera_brand, cam_model_idx),
+    
+    # Species offsets
+    delta_summary = delta_df,
+    
+    # Covariate diagnostics
+    gamma1_summary   = gamma1_summary,
+    gamma_cam_summary = gamma_cam_summary,
+    precision_gain   = precision_gain,
+    ci_excludes_zero = ci_excludes_zero,
+    
+    # Full posterior summary
+    posterior_summary = posterior_sum,
+    
+    # Raw MCMC samples (for downstream density estimation)
+    mcmc_samples = samples_raw
+  ), output_rds)
   
-  write.csv(edd_all_species,
-            paste0(OUTPUT_DIRS$model_output, "05_EDD_by_deployment_all_species.csv"),
-            row.names = FALSE)
-  write.csv(edd_summary,
-            paste0(OUTPUT_DIRS$model_output, "05_EDD_summary_by_species.csv"),
-            row.names = FALSE)
+  cat("Results saved to:", output_rds, "\n")
   
-  output_rds <- paste0(OUTPUT_DIRS$processed, "05_edd_results.rds")
-  saveRDS(list(edd_all_species = edd_all_species,
-               edd_summary     = edd_summary),
-          output_rds)
-  cat("\nResults saved to:", output_rds, "\n")
+  # Also save CSVs for quick inspection
+  if (!is.null(edd_by_obs)) {
+    write.csv(edd_by_obs,
+              paste0(OUTPUT_DIRS$model_output, "05b_EDD_joint_by_obs.csv"),
+              row.names = FALSE)
+    write.csv(edd_species_summary,
+              paste0(OUTPUT_DIRS$model_output, "05b_EDD_joint_species_summary.csv"),
+              row.names = FALSE)
+    write.csv(delta_df,
+              paste0(OUTPUT_DIRS$model_output, "05b_species_offsets_delta.csv"),
+              row.names = FALSE)
+  }
   
-} else {
-  cat("No EDD results — all species failed or were skipped\n")
-}
+}, error = function(e) {
+  cat("\n!!! MODEL ERROR !!!\n")
+  cat("Error:", conditionMessage(e), "\n\n")
+  cat("If this failed, check:\n")
+  cat("  1. Are there species-deployment combos with very few detections?\n")
+  cat("     (Multinomial needs N >= 1 in each included combo)\n")
+  cat("  2. Is B_global too large for some species? (sparse bins)\n")
+  cat("  3. Are initial values reasonable?\n")
+  cat("  4. Try running the diagnostic (niter=2000) first.\n")
+})
 
 cat("\n=============================================================\n")
-cat("STEP 05 COMPLETE\n")
+cat("STEP 05b COMPLETE\n")
 cat("=============================================================\n\n")
