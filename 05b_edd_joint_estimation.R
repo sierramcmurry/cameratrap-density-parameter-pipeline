@@ -28,6 +28,15 @@
 #   site effect α_i, which then improves EDD estimates for rare species at
 #   that same camera via partial pooling.
 #
+#   DETECTION FUNCTION: half-normal, g(r) = exp(-r^2 / (2 σ^2)).
+#   Earlier versions multiplied this by a logistic shoulder (shape_d, shape_e)
+#   inside the EDD integration only. Those parameters entered no likelihood,
+#   so they sampled their Uniform(0,10) priors while subtracting a
+#   near-constant 1.7 m from every EDD. The area-corrected empirical detection
+#   function declines monotonically from the nearest reliable distance bin, and
+#   a complete blind spot below 0.5 m would change EDD by less than 0.1%, so
+#   the shoulder is removed. Section 10b reports the diagnostic.
+#
 # DIAGNOSTIC: Compares prior vs posterior on γ_1 (scene depth effect) to
 #             address whether the covariate is informative.
 #
@@ -49,19 +58,16 @@ cat("STEP 05b: JOINT MULTI-SPECIES EDD ESTIMATION\n")
 cat("=============================================================\n\n")
 
 # =============================================================================
-# 1. EDD APPROXIMATION FUNCTION (unchanged from 05)
+# 1. EDD APPROXIMATION FUNCTION (half-normal; shoulder removed, see header)
 # =============================================================================
 
-EDD_approx_logmix <- nimbleFunction(run = function(r         = double(0),
-                                                   shape_d   = double(0),
-                                                   shape_e   = double(0),
-                                                   increment = double(0),
-                                                   B         = double(0)) {
+EDD_approx_halfnormal <- nimbleFunction(run = function(r         = double(0),
+                                                       increment = double(0),
+                                                       B         = double(0)) {
   points        <- (1:(B/increment)) * increment
   area          <- (points + increment/2)^2 - (points - increment/2)^2
   relative_area <- area / sum(area)
-  detprob       <- exp(-(points^2) / (2 * r^2)) *
-    (1 / (1 + exp(shape_d * (shape_e - points))))
+  detprob       <- exp(-(points^2) / (2 * r^2))
   E_captured    <- detprob * relative_area
   EDD           <- B * sqrt(sum(E_captured))
   return(EDD)
@@ -136,7 +142,7 @@ joint_model_code <- nimbleCode({
     log(mu[m]) <- mu_0 + mu_deploy[deploy_idx[m]] + mu_species[species_idx[m]]
     
     # EDD for this species × deployment
-    E[m] <- EDD_approx_logmix(sigma[m], shape_d, shape_e, increment = 0.01, B)
+    E[m] <- EDD_approx_halfnormal(sigma[m], increment = 0.01, B)
   }
   
   # ---- Nuisance: encounter rate intercepts ----
@@ -157,8 +163,6 @@ joint_model_code <- nimbleCode({
   # gamma_cam[c] priors defined above (reference-level coding)
   tau_alpha  ~ dgamma(0.01, 0.01)   # precision of deployment effects
   tau_delta  ~ dgamma(0.01, 0.01)   # precision of species offsets
-  shape_d   ~ dunif(0, 10)      # logistic shoulder shape
-  shape_e   ~ dunif(0, 10)      # logistic shoulder midpoint
   
   # ---- Derived quantities ----
   sd_alpha <- 1 / sqrt(tau_alpha)
@@ -449,6 +453,30 @@ trigger_all %>%
 cat("\n")
 
 # =============================================================================
+# 10b. NEAR-FIELD DETECTION DIAGNOSTIC
+# =============================================================================
+# Supports the half-normal detection function. Raw counts rise with distance
+# because bin area grows as r^2, so counts are divided by relative bin area
+# before they are read as detection probability. A near-field shoulder would
+# appear here as a rise from zero to a peak at some distance greater than zero.
+
+nearfield_diag <- trigger_all %>%
+  filter(!is.na(distance), distance < 15) %>%
+  mutate(bin_lo = floor(distance / 0.5) * 0.5) %>%
+  count(bin_lo) %>%
+  mutate(
+    bin_hi  = bin_lo + 0.5,
+    mid     = bin_lo + 0.25,
+    area_w  = (bin_hi^2 - bin_lo^2) / (15^2),
+    det_rel = (n / sum(n)) / area_w,
+    det_rel = det_rel / max(det_rel)
+  )
+
+cat("Area-corrected detection function (0.5 m bins, 0-15 m):\n")
+print(nearfield_diag %>% select(mid, n, det_rel), n = 30)
+cat("  Peak at", nearfield_diag$mid[which.max(nearfield_diag$det_rel)], "m\n\n")
+
+# =============================================================================
 # 11. ASSEMBLE NIMBLE DATA AND CONSTANTS
 # =============================================================================
 
@@ -488,8 +516,6 @@ nimble_inits <- list(
   tau_mu_deploy  = 1,
   tau_mu_species = 1,
   mu_0           = 3,
-  shape_d        = 1,
-  shape_e        = 1,
   alpha          = rep(log(10), n_deployments_total),
   delta_free     = rep(0, K - 1),
   mu_deploy      = rep(0, n_deployments_total),
@@ -512,8 +538,7 @@ monitors <- c(
   "gamma_cam",                  # camera model offsets
   "tau_alpha", "tau_delta",     # precisions
   "sd_alpha", "sd_delta",       # standard deviations (derived)
-  "sigma",                      # detection scale per observation
-  "shape_d", "shape_e"          # logistic shoulder params
+  "sigma"                       # detection scale per observation
 )
 
 tryCatch({
@@ -725,6 +750,9 @@ tryCatch({
     
     # Species offsets
     delta_summary = delta_df,
+    
+    # Detection function diagnostic (supports dropping the shoulder)
+    nearfield_diag = nearfield_diag,
     
     # Covariate diagnostics
     gamma1_summary   = gamma1_summary,
